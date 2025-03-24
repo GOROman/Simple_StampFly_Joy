@@ -28,17 +28,17 @@
 
 #include <Arduino.h>
 #include <M5AtomS3.h>
-#include <WiFi.h>
-#include <esp_now.h>
-#include <esp_wifi.h>
+#include <BLEDevice.h>
+#include <BLEServer.h>
+#include <BLEUtils.h>
+#include <BLE2902.h>
 #include <MPU6886.h>
 #include <MadgwickAHRS.h>
 #include <atoms3joy.h>
 #include <FS.h>
 #include <SPIFFS.h>
 #include "buzzer.h"
-
-#define CHANNEL 1
+#include "ble_callbacks.h"
 
 #define ANGLECONTROL 0
 #define RATECONTROL 1
@@ -48,262 +48,94 @@
 #define NOT_ALT_CONTROL_MODE 5
 #define RESO10BIT (4096)
 
+// BLE Service and Characteristic UUIDs
+#define SERVICE_UUID        "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
+#define CONTROL_CHAR_UUID   "beb5483e-36e1-4688-b7f5-ea07361b26a8"
+#define TELEMETRY_CHAR_UUID "8b7c9c6a-c2dc-41e9-a087-7f4c2f9a75d0"
 
-esp_now_peer_info_t peerInfo;
+struct {
+    uint8_t peer_addr[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+    uint8_t channel = 1;
+} peerInfo;
 
+// コントロール値
 float Throttle;
 float Phi, Theta, Psi;
-uint16_t Phi_bias =2048;
+uint16_t Phi_bias = 2048;
 uint16_t Theta_bias = 2048;
-uint16_t Psi_bias =2048;
+uint16_t Psi_bias = 2048;
 uint16_t Throttle_bias = 2048;
-short xstick=0;
-short ystick=0;
-uint8_t Mode=ANGLECONTROL;
-uint8_t AltMode=NOT_ALT_CONTROL_MODE;
-volatile uint8_t Loop_flag=0;
+
+// モード設定
+uint8_t Mode = ANGLECONTROL;
+uint8_t AltMode = NOT_ALT_CONTROL_MODE;
+uint8_t StickMode = 2;
+
+// タイマー関連
+volatile uint8_t Loop_flag = 0;
 float Timer = 0.0;
 float dTime = 0.01;
 uint8_t Timer_state = 0;
-uint8_t StickMode = 2;
-uint32_t espnow_version;
-volatile uint8_t proactive_flag          = 0;
-unsigned long stime,etime,dtime;
-uint8_t axp_cnt=0;
-uint8_t is_peering=0;
-uint8_t senddata[25];//19->22->23->24->25
-uint8_t disp_counter=0;
+uint8_t disp_counter = 0;
+volatile uint8_t proactive_flag = 0;
+unsigned long stime, etime, dtime;
 
-//StampFly MAC ADDRESS
-//1 F4:12:FA:66:80:54 (Yellow)
-//2 F4:12:FA:66:77:A4
-uint8_t Addr1[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
-uint8_t Addr2[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
-
-
-//Channel
-uint8_t Ch_counter;
-volatile uint8_t Received_flag = 0;
-volatile uint8_t Channel = CHANNEL;
+// BLE関連
+BLEServer* pServer = nullptr;
+BLECharacteristic* pControlCharacteristic = nullptr;
+BLECharacteristic* pTelemetryCharacteristic = nullptr;
+volatile bool BleConnected = false;
+static uint32_t connectionCounter = 0;
 
 void rc_init(void);
 void data_send(void);
 void show_battery_info();
 void voltage_print(void);
 
-// 受信コールバック
-void OnDataRecv(const uint8_t *mac_addr, const uint8_t *recv_data, int data_len) 
-{
-  if (is_peering) {
-    if (recv_data[7] == 0xaa && recv_data[8] == 0x55 && recv_data[9] == 0x16 && recv_data[10] == 0x88) {
-        Received_flag = 1;
-        Channel       = recv_data[0];
-        Addr2[0]      = recv_data[1];
-        Addr2[1]      = recv_data[2];
-        Addr2[2]      = recv_data[3];
-        Addr2[3]      = recv_data[4];
-        Addr2[4]      = recv_data[5];
-        Addr2[5]      = recv_data[6];
-        USBSerial.printf("Receive !\n");
-    }
-  }
-  else {
-    //データ受信時に実行したい内容をここに書く。
-    float a;
-    uint8_t *dummy;
-    uint8_t offset = 2;
 
-    //Channel_detected_flag++;
-    //if(Channel_detected_flag>10)Channel_detected_flag=10;
-    //Serial.printf("Channel=%d  ",Channel);
-    dummy=(uint8_t*)&a;
-    dummy[0]=recv_data[0];
-    dummy[1]=recv_data[1];
-    if (dummy[0]==0xF4)return;
-    if ((dummy[0]==99)&&(dummy[1]==99))Serial.printf("#PID Gain P Ti Td Eta ");
-    USBSerial.printf("%d ",(data_len-2)/4);
-    for (uint8_t i=0; i<((data_len-offset)/4); i++)
-    {
-      dummy[0]=recv_data[i*4 + 0 + offset];
-      dummy[1]=recv_data[i*4 + 1 + offset];
-      dummy[2]=recv_data[i*4 + 2 + offset];
-      dummy[3]=recv_data[i*4 + 3 + offset];
-      if (i<((data_len-offset)/4)-1){
-        USBSerial.printf("%9.4f ", a);
-        //USBSerial.printf("%02d ", i);
-      }
-      else {
-        USBSerial.printf("%2d %2d %4d", dummy[0], dummy[1], dummy[2]+256*dummy[3]);
-      }
-    }
-    USBSerial.printf("\r\n");
-  }
-}
 
 #define BUF_SIZE 128
 // EEPROMにデータを保存する
-void save_data(void) 
+
+
+void rc_init(void)
 {
-  SPIFFS.begin(true);
-  /* CREATE FILE */
-  File fp = SPIFFS.open("/peer_info.txt", FILE_WRITE); // 書き込み、存在すれば上書き
-  char buf[BUF_SIZE + 1];
-  sprintf(buf, "%d,%02X,%02X,%02X,%02X,%02X,%02X", 
-          Channel, 
-          Addr2[0],
-          Addr2[1],
-          Addr2[2],
-          Addr2[3],
-          Addr2[4],
-          Addr2[5]);
-  fp.write((uint8_t *)buf, BUF_SIZE);
-  fp.close();
-  SPIFFS.end();
+    // BLEデバイスの初期化
+    BLEDevice::init("StampFly");
 
-  USBSerial.printf("Saved Data:%d,[%02X:%02X:%02X:%02X:%02X:%02X]",
-      Channel, 
-      Addr2[0],
-      Addr2[1],
-      Addr2[2],
-      Addr2[3],
-      Addr2[4],
-      Addr2[5]);    
-}
+    // BLEサーバーの作成
+    pServer = BLEDevice::createServer();
+    pServer->setCallbacks(new ServerCallbacks());
 
-// EEPROMからデータを読み出す
-void load_data(void) 
-{
-  SPIFFS.begin(true);
-  File fp = SPIFFS.open("/peer_info.txt", FILE_READ);
-  char buf[BUF_SIZE + 1];
-  while (fp.read((uint8_t *)buf, BUF_SIZE) == BUF_SIZE)
-  {
-    //USBSerial.print(buf);
-    sscanf(buf,"%hhd,%hhX,%hhX,%hhX,%hhX,%hhX,%hhX",
-          &Channel, 
-          &Addr2[0],
-          &Addr2[1],
-          &Addr2[2],
-          &Addr2[3],
-          &Addr2[4],
-          &Addr2[5]);    
-    USBSerial.printf("%d,%02X,%02X,%02X,%02X,%02X,%02X\n\r",
-          Channel, 
-          Addr2[0],
-          Addr2[1],
-          Addr2[2],
-          Addr2[3],
-          Addr2[4],
-          Addr2[5]);    
-  }
-  fp.close();
-  SPIFFS.end();
-}
+    // BLEサービスの作成
+    BLEService *pService = pServer->createService(SERVICE_UUID);
 
-void rc_init(uint8_t ch, uint8_t* addr)
-{  
-    // ESP-NOW初期化
-    WiFi.mode(WIFI_STA);
-    WiFi.disconnect();
-    if (esp_now_init() == ESP_OK) {
-        esp_now_unregister_recv_cb();
-        esp_now_register_recv_cb(OnDataRecv);
-        USBSerial.println("ESPNow Init Success");
-    } else {
-        USBSerial.println("ESPNow Init Failed");
-        ESP.restart();
-    }
+    // コントロールキャラクタリスティックの作成
+    pControlCharacteristic = pService->createCharacteristic(
+        CONTROL_CHAR_UUID,
+        BLECharacteristic::PROPERTY_WRITE
+    );
+    pControlCharacteristic->setCallbacks(new ControlCallbacks());
 
-    memset(&peerInfo, 0, sizeof(peerInfo));
-    memcpy(peerInfo.peer_addr, addr, 6);
-    peerInfo.channel = ch;
-    peerInfo.encrypt = false;
-    uint8_t peer_mac_addre;
-    while (esp_now_add_peer(&peerInfo) != ESP_OK) {
-        USBSerial.println("Failed to add peer");
-    }
-    esp_wifi_set_channel(ch, WIFI_SECOND_CHAN_NONE);
-}
+    // テレメトリーキャラクタリスティックの作成
+    pTelemetryCharacteristic = pService->createCharacteristic(
+        TELEMETRY_CHAR_UUID,
+        BLECharacteristic::PROPERTY_NOTIFY
+    );
+    pTelemetryCharacteristic->addDescriptor(new BLE2902());
 
-void peering(void)
-{
-  uint8_t break_flag;
-  uint32_t beep_delay = 0;
-  //StampFlyはMACアドレスをFF:FF:FF:FF:FF:FFとして
-  //StampFlyのMACアドレスをでブロードキャストする
-  //その際にChannelが機体と送信機で同一でない場合は受け取れない
-  // ESP-NOWコールバック登録
-  esp_now_register_recv_cb(OnDataRecv);
+    // サービスの開始
+    pService->start();
 
-  //ペアリング
-  Ch_counter = 1;
-  while(1)
-  {
-    USBSerial.printf("Try channel %02d.\n\r", Ch_counter);
-    peerInfo.channel = Ch_counter;
-    peerInfo.encrypt = false;
-    while (esp_now_mod_peer(&peerInfo) != ESP_OK) 
-    {
-        USBSerial.println("Failed to mod peer");
-    }
-    esp_wifi_set_channel(Ch_counter, WIFI_SECOND_CHAN_NONE);
+    // アドバタイジングの開始
+    BLEAdvertising *pAdvertising = BLEDevice::getAdvertising();
+    pAdvertising->addServiceUUID(SERVICE_UUID);
+    pAdvertising->setScanResponse(true);
+    pAdvertising->setMinPreferred(0x06);  // iPhoneの接続問題を解決するための設定
+    pAdvertising->setMinPreferred(0x12);
+    BLEDevice::startAdvertising();
 
-    //Wait receive StampFly MAC Address
-    //uint32_t counter=1;
-    //Channelをひとつづつ試していく
-    for (uint8_t i =0;i<100;i++)
-    {
-          break_flag = 0;
-          if (Received_flag == 1)
-          {
-            break_flag = 1;
-            break;
-          }
-          usleep(100);
-    }
-    if (millis() - beep_delay >= 500) {
-        beep();
-        beep_delay = millis();
-    }
-
-    if (break_flag)break;
-    Ch_counter++;
-    if(Ch_counter==15)Ch_counter=1;
-  }
-  //Channel = Ch_counter;
-
-  save_data();
-  is_peering = 0;
-  USBSerial.printf("Channel:%02d\n\r", Channel);
-  USBSerial.printf("MAC2:%02X:%02X:%02X:%02X:%02X:%02X:\n\r",
-                    Addr2[0],Addr2[1],Addr2[2],Addr2[3],Addr2[4],Addr2[5]);
-  USBSerial.printf("MAC1:%02X:%02X:%02X:%02X:%02X:%02X:\n\r",
-                    Addr1[0],Addr1[1],Addr1[2],Addr1[3],Addr1[4],Addr1[5]);
-
-  //Peering
-  while (esp_now_del_peer(Addr1) != ESP_OK) {
-    Serial.println("Failed to delete peer1");
-  }
-  memset(&peerInfo, 0, sizeof(peerInfo));
-  memcpy(peerInfo.peer_addr, Addr2, 6);//Addr1->Addr2 ////////////////////////////
-  peerInfo.channel = Channel;
-  peerInfo.encrypt = false;
-  while (esp_now_add_peer(&peerInfo) != ESP_OK) 
-  {
-        USBSerial.println("Failed to add peer2");
-  }  
-  esp_wifi_set_channel(Channel, WIFI_SECOND_CHAN_NONE);
-}
-
-void change_channel(uint8_t ch)
-{
-  peerInfo.channel = ch;
-  if (esp_now_mod_peer(&peerInfo)!=ESP_OK)
-  {
-        USBSerial.println("Failed to modify peer");
-        return;
-  }
-  esp_wifi_set_channel(ch, WIFI_SECOND_CHAN_NONE);
+    USBSerial.println("BLE Server Ready");
 }
 
 //周期カウンタ割り込み関数
@@ -311,39 +143,20 @@ hw_timer_t * timer = NULL;
 void IRAM_ATTR onTimer() 
 {
   Loop_flag = 1;
-  //Timer = Timer + dTime;
 }
 
 void setup() {
   M5.begin();
   Wire1.begin(38, 39, 400*1000);
-  load_data();
   M5.update();
   setup_pwm_buzzer();
   M5.Lcd.setRotation( 2 );
   M5.Lcd.setTextFont(2);
   M5.Lcd.setCursor(4, 2);
   
-  if (M5.Btn.isPressed() || (Addr2[0] == 0xFF && Addr2[1] == 0xFF && Addr2[2] == 0xFF && Addr2[3] == 0xFF &&
-                               Addr2[4] == 0xFF && Addr2[5] == 0xFF)) {
-    M5.Lcd.println("Push LCD panel!");
-    while (1) {
-      M5.update();
-      if (M5.Btn.wasPressed()) {
-        is_peering = 1;
-        break;
-      }
-    }
-    rc_init(1, Addr1);
-    USBSerial.printf("Button pressed!\n\r");
-    M5.Lcd.println(" ");
-    M5.Lcd.println("Push StampFly");
-    M5.Lcd.println("    Reset Button!");
-    M5.Lcd.println(" ");
-    M5.Lcd.println("Pairing...");
-    peering();
-  }
-  else rc_init(Channel, Addr2);
+  // BLEの初期化
+  rc_init();
+  M5.Lcd.println("BLE Ready!");
   M5.Lcd.fillScreen(BLACK);
   joy_update();
 
@@ -415,8 +228,8 @@ void setup() {
   else
     USBSerial.println("done\n");
 
-  esp_now_get_version(&espnow_version);
-  USBSerial.printf("ESP-NOW Version %d\n", espnow_version);
+  // ESP-NOW removed, replaced with BLE
+  USBSerial.println("Using BLE communication");
 
 
   //割り込み設定
@@ -478,11 +291,10 @@ uint8_t check_alt_mode_change(void)
 
 
 void loop() {
-  uint16_t _throttle;// = getThrottle();
-  uint16_t _phi;// = getAileron();
-  uint16_t _theta;// = getElevator();
-  uint16_t _psi;// = getRudder();
-
+  uint16_t _throttle;
+  uint16_t _phi;
+  uint16_t _theta;
+  uint16_t _psi;
 
   while(Loop_flag==0);
   Loop_flag = 0;
@@ -533,7 +345,6 @@ void loop() {
   _theta = getElevator();
   _psi = getRudder();
 
-
   if(getArmButton()==1)
   {
     //Throttle_bias = _throttle;
@@ -548,58 +359,29 @@ void loop() {
   Theta =     (float)(_theta - Theta_bias)/(float)(RESO10BIT*0.5);
   Psi =       (float)(_psi - Psi_bias)/(float)(RESO10BIT*0.5);
 
-  //最終試作版
-  #if 0
-  Throttle = (float)(_throttle - Throttle_bias)/(float)(RESO10BIT*0.5);
-  Phi =      (float)(_phi - Phi_bias)/(float)(RESO10BIT*0.5); 
-  Theta =   -(float)(_theta - Theta_bias)/(float)(RESO10BIT*0.5);
-  Psi =      (float)(_psi - Psi_bias)/(float)(RESO10BIT*0.5);
-  #endif
+  // テレメトリーデータの送信
+  if (BleConnected && pTelemetryCharacteristic != nullptr) {
+    float telemetryData[16] = {0};
+    telemetryData[0] = Psi;
+    telemetryData[1] = Throttle;
+    telemetryData[2] = Phi;
+    telemetryData[3] = Theta;
+    telemetryData[4] = (float)getArmButton();
+    telemetryData[5] = (float)getFlipButton();
+    telemetryData[6] = (float)Mode;
+    telemetryData[7] = (float)AltMode;
+    telemetryData[8] = (float)proactive_flag;
 
+    pTelemetryCharacteristic->setValue((uint8_t*)telemetryData, sizeof(float) * 16);
+    pTelemetryCharacteristic->notify();
+  }
 
-  uint8_t* d_int;
-  
-  //ブロードキャストの混信を防止するためこの機体のMACアドレスに送られてきたものか判断する
-  senddata[0] = peerInfo.peer_addr[3];////////////////////////////
-  senddata[1] = peerInfo.peer_addr[4];////////////////////////////
-  senddata[2] = peerInfo.peer_addr[5];////////////////////////////
-
-  d_int = (uint8_t*)&Psi;
-  senddata[3]=d_int[0];
-  senddata[4]=d_int[1];
-  senddata[5]=d_int[2];
-  senddata[6]=d_int[3];
-
-  d_int = (uint8_t*)&Throttle;
-  senddata[7]=d_int[0];
-  senddata[8]=d_int[1];
-  senddata[9]=d_int[2];
-  senddata[10]=d_int[3];
-
-  d_int = (uint8_t*)&Phi;
-  senddata[11]=d_int[0];
-  senddata[12]=d_int[1];
-  senddata[13]=d_int[2];
-  senddata[14]=d_int[3];
-
-  d_int = (uint8_t*)&Theta;
-  senddata[15]=d_int[0];
-  senddata[16]=d_int[1];
-  senddata[17]=d_int[2];
-  senddata[18]=d_int[3];
-
-  senddata[19]=getArmButton();
-  senddata[20]=getFlipButton();
-  senddata[21]=Mode;
-  senddata[22]=AltMode;
-  senddata[23]=proactive_flag;
-  
-  //checksum
-  senddata[24]=0;
-  for(uint8_t i=0;i<24;i++)senddata[24]=senddata[24]+senddata[i];
-  
-  //送信
-  esp_err_t result = esp_now_send(peerInfo.peer_addr, senddata, sizeof(senddata));
+  // 接続タイムアウトの検出
+  connectionCounter++;
+  if (connectionCounter > 1000) { // 約10秒のタイムアウト
+    BleConnected = false;
+    connectionCounter = 0;
+  }
   #ifdef DEBUG
   USBSerial.printf("%02X:%02X:%02X:%02X:%02X:%02X\n",
     peerInfo.peer_addr[0],
@@ -682,7 +464,6 @@ void show_battery_info(){
 
 void voltage_print(void)
 {
-
   M5.Lcd.setCursor(0, 17, 2);
-  M5.Lcd.printf("%3.1fV", Battery_voltage);
+  M5.Lcd.printf("%3.1fV %3.1fV", Battery_voltage[0], Battery_voltage[1]);
 }
