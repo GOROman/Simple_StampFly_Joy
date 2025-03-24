@@ -38,6 +38,7 @@
 #include <FS.h>
 #include <SPIFFS.h>
 #include "buzzer.h"
+#include "ble_callbacks.h"
 
 #define ANGLECONTROL 0
 #define RATECONTROL 1
@@ -51,6 +52,11 @@
 #define SERVICE_UUID        "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
 #define CONTROL_CHAR_UUID   "beb5483e-36e1-4688-b7f5-ea07361b26a8"
 #define TELEMETRY_CHAR_UUID "8b7c9c6a-c2dc-41e9-a087-7f4c2f9a75d0"
+
+struct {
+    uint8_t peer_addr[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+    uint8_t channel = 1;
+} peerInfo;
 
 // コントロール値
 float Throttle;
@@ -70,6 +76,8 @@ volatile uint8_t Loop_flag = 0;
 float Timer = 0.0;
 float dTime = 0.01;
 uint8_t Timer_state = 0;
+uint8_t disp_counter = 0;
+volatile uint8_t proactive_flag = 0;
 unsigned long stime, etime, dtime;
 
 // BLE関連
@@ -220,8 +228,8 @@ void setup() {
   else
     USBSerial.println("done\n");
 
-  esp_now_get_version(&espnow_version);
-  USBSerial.printf("ESP-NOW Version %d\n", espnow_version);
+  // ESP-NOW removed, replaced with BLE
+  USBSerial.println("Using BLE communication");
 
 
   //割り込み設定
@@ -456,7 +464,6 @@ void show_battery_info(){
 
 void voltage_print(void)
 {
-
   M5.Lcd.setCursor(0, 17, 2);
-  M5.Lcd.printf("%3.1fV", Battery_voltage);
+  M5.Lcd.printf("%3.1fV %3.1fV", Battery_voltage[0], Battery_voltage[1]);
 }
